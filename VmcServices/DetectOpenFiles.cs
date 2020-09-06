@@ -194,24 +194,49 @@ namespace VmcController.Services
         };
 
         private const int handleTypeTokenCount = 27;
-        private static readonly string[] handleTypeTokens = new string[] { 
+        private static readonly string[] handleTypeTokens = new string[] {
                 "", "", "Directory", "SymbolicLink", "Token",
                 "Process", "Thread", "Unknown7", "Event", "EventPair", "Mutant",
                 "Unknown11", "Semaphore", "Timer", "Profile", "WindowStation",
                 "Desktop", "Section", "Key", "Port", "WaitablePort",
-                "Unknown21", "Unknown22", "Unknown23", "Unknown24", 
+                "Unknown21", "Unknown22", "Unknown23", "Unknown24",
                 "IoCompletion", "File"
             };
 
-        [StructLayout(LayoutKind.Sequential)]
+        // Modified from original solution based on https://stackoverflow.com/a/9995536
+        [StructLayout(LayoutKind.Sequential, Pack = 1)]
         private struct SYSTEM_HANDLE_ENTRY
         {
-            public int OwnerPid;
+            public IntPtr OwnerPid;
             public byte ObjectType;
             public byte HandleFlags;
             public short HandleValue;
-            public int ObjectPointer;
+            public IntPtr ObjectPointer;
             public int AccessMask;
+        }
+
+        [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+        private struct UNICODE_STRING
+        {
+            public ushort Length;
+            public ushort MaximumLength;
+            [MarshalAs(UnmanagedType.LPWStr)]
+            public string Buffer;
+        }
+
+        [StructLayout(LayoutKind.Sequential, Pack = 1)]
+        private struct OBJECT_TYPE_INFORMATION
+        {
+            public UNICODE_STRING TypeName;
+            [MarshalAs(UnmanagedType.ByValArray, SizeConst = 22)]
+            public ulong[] Reserved;
+        }
+
+        [StructLayout(LayoutKind.Sequential, Pack = 1)]
+        private struct OBJECT_NAME_INFORMATION
+        {
+            public UNICODE_STRING Name;
+            public IntPtr NameBuffer;
         }
 
         /// <summary>
@@ -271,16 +296,17 @@ namespace VmcController.Services
                             int size = Marshal.SizeOf(typeof(SYSTEM_HANDLE_ENTRY));
                             for (int i = 0; i < handleCount; i++)
                             {
-                                SYSTEM_HANDLE_ENTRY handleEntry = (SYSTEM_HANDLE_ENTRY)Marshal.PtrToStructure((IntPtr)((int)ptr + offset), typeof(SYSTEM_HANDLE_ENTRY));
-                                if (handleEntry.OwnerPid == processId)
+                                SYSTEM_HANDLE_ENTRY handleEntry = (SYSTEM_HANDLE_ENTRY)Marshal.PtrToStructure(IntPtrAdd(ptr, offset), typeof(SYSTEM_HANDLE_ENTRY));
+                                int ownerProcessId = GetProcessId(handleEntry.OwnerPid);
+                                if (ownerProcessId == processId)
                                 {
                                     IntPtr handle = (IntPtr)handleEntry.HandleValue;
                                     SystemHandleType handleType;
 
-                                    if (GetHandleType(handle, handleEntry.OwnerPid, out handleType) && handleType == SystemHandleType.OB_TYPE_FILE)
+                                    if (GetHandleType(handle, ownerProcessId, out handleType) && handleType == SystemHandleType.OB_TYPE_FILE)
                                     {
                                         string devicePath;
-                                        if (GetFileNameFromHandle(handle, handleEntry.OwnerPid, out devicePath))
+                                        if (GetFileNameFromHandle(handle, ownerProcessId, out devicePath))
                                         {
                                             string dosPath;
                                             if (ConvertDevicePathToDosPath(devicePath, out dosPath))
@@ -326,6 +352,28 @@ namespace VmcController.Services
         }
 
         #region Private Members
+
+        private static IntPtr IntPtrAdd(IntPtr ptr, int offset)
+        {
+            if (IntPtr.Size == 4)
+            {
+                return (IntPtr)((int)ptr + offset);
+            }
+            else
+            {
+                return (IntPtr)((long)ptr + offset);
+            }
+        }
+
+        private static int GetProcessId(IntPtr processId)
+        {
+            if (IntPtr.Size == 4)
+            {
+                return (int)processId;
+            }
+
+            return (int)((long)processId >> 32);
+        }
 
         private static bool GetFileNameFromHandle(IntPtr handle, int processId, out string fileName)
         {
@@ -426,7 +474,7 @@ namespace VmcController.Services
 
             public bool WaitOne(int wait)
             {
-               return _mr.WaitOne(wait, false);
+                return _mr.WaitOne(wait, false);
             }
 
             public void Set()
@@ -486,7 +534,8 @@ namespace VmcController.Services
                 }
                 if (ret == NT_STATUS.STATUS_SUCCESS)
                 {
-                    fileName = Marshal.PtrToStringUni((IntPtr)((int)ptr + 8), (length - 9) / 2);
+                    OBJECT_NAME_INFORMATION objNameInfo = (OBJECT_NAME_INFORMATION)Marshal.PtrToStructure(ptr, typeof(OBJECT_NAME_INFORMATION));
+                    fileName = objNameInfo.Name.Buffer;
                     return fileName.Length != 0;
                 }
             }
@@ -577,7 +626,8 @@ namespace VmcController.Services
                 }
                 if (NativeMethods.NtQueryObject(handle, OBJECT_INFORMATION_CLASS.ObjectTypeInformation, ptr, length, out length) == NT_STATUS.STATUS_SUCCESS)
                 {
-                    return Marshal.PtrToStringUni((IntPtr)((int)ptr + 0x60));
+                    OBJECT_TYPE_INFORMATION objTypeInfo = (OBJECT_TYPE_INFORMATION)Marshal.PtrToStructure(ptr, typeof(OBJECT_TYPE_INFORMATION));
+                    return objTypeInfo.TypeName.Buffer;
                 }
             }
             finally
